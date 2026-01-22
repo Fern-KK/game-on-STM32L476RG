@@ -1,0 +1,4 @@
+../Core/Src/sx1509.c:12:13:delayNOP	2
+../Core/Src/sx1509.c:23:9:readByte	3
+../Core/Src/sx1509.c:39:10:readWord	3
+../Core/Src/sx1509.c:58:6:reset	3
