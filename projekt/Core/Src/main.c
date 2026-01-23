@@ -38,7 +38,6 @@ SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart2;
 uint32_t topScores[3] = {0, 0, 0};
 Dot dots[10];
-/* Bitmaps */
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -801,6 +800,7 @@ void Error_Handler(void)
     {
     }
 }
+
 
 
 
