@@ -15,10 +15,13 @@
 #define DATA_SIZE sizeof(flash_datatype)
 #define MAP_WIDTH 128
 #define MAP_HEIGHT 64
+#define MAP_NO_DOTS_ZONE 15
+#define PLAYER_LIMIT 24
 /* Private typedef -----------------------------------------------------------*/
 typedef uint64_t flash_datatype;
 typedef struct
 {
+    char nickname[11];
     int x;
     int y;
     int radius;
@@ -32,12 +35,19 @@ typedef struct
     int x;
     int y;
 } Dot;
+typedef struct
+{
+    uint32_t score;
+    char nickname[11];
+} HighScore;
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart2;
-uint32_t topScores[3] = {0, 0, 0};
+HighScore topScores[3];
 Dot dots[10];
+player myPlayer;
+/* Bitmaps */
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -52,17 +62,22 @@ int dotEat(player *p);
 void dotPosition(int n);
 void dotDraw(void);
 void loadHighScores(void);
-void updateHighScores(uint32_t newScore);
+void updateHighScores(uint32_t newScore, const char *newName);
 void menuDisplay(void);
 void drawMenuInterface(void);
+void drawNickInterface(void);
 void loadingAnimation(void);
 void showDescription(void);
 void showAuthors(void);
 void showScores(void);
 void winAnimation(void);
 void loseAnimation(void);
+void drawAnimation(void);
 void thanksForPlaying(void);
 void updatePlayerSpeed(player *p, int my_speed);
+void resetHighScores(void);
+void calculateBotMovement(player *bot, player *myPlayer);
+void resetGame(player *bot, player *myPlayer);
 /* Flash Memory Functions */
 void read_flash_memory(uint32_t memory_address, uint8_t *data, uint16_t data_length);
 void store_flash_memory(uint32_t memory_address, uint8_t *data, uint16_t data_length);
@@ -81,8 +96,9 @@ int main(void)
     ssd1306_Init();
     /* Game State Initialization */
     loadHighScores();
-    player myPlayer = createPlayer(10, 10);
+    myPlayer = createPlayer(10, 10);
     player bot = createPlayer(MAP_WIDTH - 10, MAP_WIDTH - 10);
+    bot.dx = 1;
     for (int i = 0; i < 10; i++)
         dotPosition(i);
     HAL_UART_Transmit(&huart2, (uint8_t *)"\033[2J\033[HScore: 0", strlen("\033[2J\033[HScore: 0"), 30);
@@ -130,7 +146,6 @@ int main(void)
         if (dotEat(&myPlayer))
         {
             // Only update Highscore/UART if the HUMAN eats
-            updateHighScores(myPlayer.score);
             char _score[20];
             sprintf(_score, "\033[2J\033[HScore: %d", myPlayer.score);
             HAL_UART_Transmit(&huart2, (uint8_t *)_score, strlen(_score), 30);
@@ -140,7 +155,7 @@ int main(void)
         // --- 5. PVP COLLISION ---
         // Simple check: Distance between centers < sum of radii
         int distSq = (myPlayer.x - bot.x) * (myPlayer.x - bot.x) + (myPlayer.y - bot.y) * (myPlayer.y - bot.y);
-        if (bot.radius > myPlayer.radius)
+        if (bot.radius > myPlayer.radius + 1)
         {
             // Bot is bigger: Does the Bot's radius reach the Player's center?
             if (distSq < (bot.radius * bot.radius))
@@ -150,15 +165,23 @@ int main(void)
                 menuDisplay();
             }
         }
-        else
+        else if (bot.radius + 1 < myPlayer.radius)
         {
             // Player is bigger: Does the Player's radius reach the Bot's center?
             if (distSq < (myPlayer.radius * myPlayer.radius))
             {
+                updateHighScores(myPlayer.score, myPlayer.nickname);
                 winAnimation();
                 resetGame(&bot, &myPlayer);
                 menuDisplay();
             }
+        }
+        // DRAW
+        if (bot.radius == PLAYER_LIMIT && myPlayer.radius == PLAYER_LIMIT)
+        {
+            drawAnimation();
+            resetGame(&bot, &myPlayer);
+            menuDisplay();
         }
         // --- 6. DRAWING ---
         ssd1306_Fill(Black);
@@ -171,12 +194,11 @@ int main(void)
         HAL_Delay(30);
     }
 }
-
-
 /* Game Logic Implementations ------------------------------------------------*/
 player createPlayer(int x, int y)
 {
     player p;
+    p.nickname[0] = '\0';
     p.x = x - 3;
     p.y = y - 3;
     p.radius = 3;
@@ -235,8 +257,8 @@ int dotEat(player *p)
         {
             p->score++;
             p->radius = 3 + (p->score / 5);
-            if (p->radius > 30)
-                p->radius = 30;
+            if (p->radius > PLAYER_LIMIT)
+                p->radius = PLAYER_LIMIT;
             dotPosition(i);
             eaten = 1;
         }
@@ -250,9 +272,8 @@ void calculateBotMovement(player *bot, player *human)
     int botCenterY = bot->y + bot->radius;
     int targetX = 0;
     int targetY = 0;
-
     // --- 2. Find Target ---
-    if (bot->radius > human->radius + 2)
+    if (bot->radius > human->radius + 1)
     {
         targetX = human->x + human->radius;
         targetY = human->y + human->radius;
@@ -261,7 +282,6 @@ void calculateBotMovement(player *bot, player *human)
     {
         int minDistSq = 2000000000;
         int bestDotIndex = -1;
-
         for (int i = 0; i < 10; i++)
         {
             int diffX = botCenterX - dots[i].x;
@@ -273,57 +293,69 @@ void calculateBotMovement(player *bot, player *human)
                 bestDotIndex = i;
             }
         }
-
-        if (bestDotIndex != -1) {
+        if (bestDotIndex != -1)
+        {
             targetX = dots[bestDotIndex].x;
             targetY = dots[bestDotIndex].y;
-        } else {
+        }
+        else
+        {
             targetX = botCenterX;
             targetY = botCenterY;
         }
     }
-
-    // --- 3. Strict Non-Diagonal Movement ---
-
-    // CHECK X DISTANCE
-    // If we are far from X, move X and STOP Y
-    if (abs(botCenterX - targetX) > bot->speed)
+    // --- 3. Strict Non-Diagonal Movement (State Machine) ---
+    // STATE: MOVING X
+    // We stay in this state if dx is not 0
+    if (bot->dx != 0)
     {
-        if (botCenterX < targetX)
-            bot->dx = 1;
+        // Go to X
+        if (abs(botCenterX - targetX) > bot->speed)
+        {
+            if (botCenterX < targetX)
+                bot->dx = 1;
+            else
+                bot->dx = -1;
+            bot->dy = 0; // Ensure no diagonal
+        }
+        // We arrived at X
         else
-            bot->dx = -1;
-
-        // CRITICAL: Force Y to 0 so we don't move diagonally
-        bot->dy = 0;
+        {
+            // Snap to X Grid
+            bot->x = targetX - bot->radius;
+            bot->dx = 0;
+            // Force dy to 1 so the 'else' block runs next frame
+            bot->dy = 1;
+        }
     }
-    // X IS DONE (Snap and check Y)
+    // STATE: MOVING Y
     else
     {
-        // Snap X exactly to target
-        bot->x = targetX - bot->radius;
-        bot->dx = 0;
-
-        // NOW CHECK Y DISTANCE
+        // Go to y
         if (abs(botCenterY - targetY) > bot->speed)
         {
             if (botCenterY < targetY)
                 bot->dy = 1;
             else
                 bot->dy = -1;
+            bot->dx = 0;
         }
+        // We arrived at Y
         else
         {
-            // Snap Y exactly to target
+            // Snap to Y Grid
             bot->y = targetY - bot->radius;
             bot->dy = 0;
+            // HANDOVER: Force dx to 1 so the 'if' block runs next frame
+            // This restarts the cycle to check X again
+            bot->dx = 1;
         }
     }
 }
 void dotPosition(int n)
 {
-    dots[n].x = rand() % MAP_WIDTH;
-    dots[n].y = rand() % MAP_HEIGHT;
+    dots[n].x = (rand() % (MAP_WIDTH - MAP_NO_DOTS_ZONE * 2 + 1)) + MAP_NO_DOTS_ZONE;
+    dots[n].y = (rand() % (MAP_HEIGHT - MAP_NO_DOTS_ZONE * 2 + 1)) + MAP_NO_DOTS_ZONE;
 }
 void dotDraw(void)
 {
@@ -341,6 +373,8 @@ void menuDisplay(void)
         switch (buffer[0])
         {
         case '1':
+            if (myPlayer.nickname[0] == '\0')
+                drawNickInterface();
             loadingAnimation();
             return;
         case '2':
@@ -355,8 +389,9 @@ void menuDisplay(void)
             showScores();
             drawMenuInterface();
             break;
-        case '5':
+        case '9':
             resetHighScores();
+            break;
         }
     }
 }
@@ -364,15 +399,63 @@ void drawMenuInterface(void)
 {
     ssd1306_Fill(Black);
     ssd1306_DrawBitmap(0, 0, menu, 128, 64, White);
-    ssd1306_SetCursor(16, 15);
+    ssd1306_SetCursor(12, 15);
     ssd1306_WriteString("1. Graj", Font_6x8, White);
-    ssd1306_SetCursor(16, 25);
+    ssd1306_SetCursor(12, 25);
     ssd1306_WriteString("2. Opis gry", Font_6x8, White);
-    ssd1306_SetCursor(16, 35);
+    ssd1306_SetCursor(12, 35);
     ssd1306_WriteString("3. Autorzy", Font_6x8, White);
-    ssd1306_SetCursor(16, 45);
+    ssd1306_SetCursor(12, 45);
     ssd1306_WriteString("4. Tablica wynikow", Font_6x8, White);
     ssd1306_UpdateScreen();
+}
+void drawNickInterface(void)
+{
+    char *nickname = myPlayer.nickname;
+    uint8_t len = 0;
+    uint8_t rx_data;
+    uint32_t last_tick = HAL_GetTick();
+    uint8_t cursor_visible = 1;
+    while (1)
+    {
+        if (HAL_UART_Receive(&huart2, &rx_data, 1, 10) == HAL_OK)
+        {
+            if (rx_data == '\r' || rx_data == '\n')
+            {
+                break;
+            }
+            else if (rx_data == 0x08 || rx_data == 0x7F)
+            {
+                if (len > 0)
+                {
+                    len--;
+                    nickname[len] = '\0';
+                }
+            }
+            else if (len < 10 && rx_data >= 32 && rx_data <= 126)
+            {
+                nickname[len] = rx_data;
+                len++;
+                nickname[len] = '\0';
+            }
+        }
+        if (HAL_GetTick() - last_tick > 500)
+        {
+            cursor_visible = !cursor_visible;
+            last_tick = HAL_GetTick();
+        }
+        ssd1306_Fill(Black);
+        ssd1306_DrawBitmap(0, 0, menu, 128, 64, White);
+        ssd1306_SetCursor(16, 15);
+        ssd1306_WriteString("Wpisz nick:", Font_6x8, White);
+        ssd1306_SetCursor(16, 25);
+        ssd1306_WriteString(nickname, Font_6x8, White);
+        if (cursor_visible)
+        {
+            ssd1306_WriteString("|", Font_6x8, White);
+        }
+        ssd1306_UpdateScreen();
+    }
 }
 void loadingAnimation(void)
 {
@@ -418,45 +501,50 @@ void showDescription(void)
     ssd1306_SetCursor(34, 0);
     ssd1306_WriteString("Opis (1/2)", Font_6x8, White);
     ssd1306_SetCursor(0, 16);
-    ssd1306_WriteString("Jest to gra inspiro-", Font_6x8, White);
-    ssd1306_SetCursor(0, 26);
-    ssd1306_WriteString("wana gra Agario. Zro-", Font_6x8, White);
-    ssd1306_SetCursor(0, 36);
-    ssd1306_WriteString("biona z pasja do je-", Font_6x8, White);
-    ssd1306_SetCursor(0, 46);
-    ssd1306_WriteString("zyka C oraz mikrokon-", Font_6x8, White);
+    ssd1306_WriteString("Celem gry  jest poko-", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 1);
+    ssd1306_WriteString("nanie   zlego   brata", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 2);
+    ssd1306_WriteString("blizniaka.", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 3);
+    ssd1306_WriteString("Zdobywaj  mase  poze-", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 4);
+    ssd1306_WriteString("rajac   male  kropki.", Font_6x8, White);
     ssd1306_UpdateScreen();
-    HAL_Delay(5000);
+    HAL_Delay(10000);
     ssd1306_Fill(Black);
     ssd1306_SetCursor(34, 0);
     ssd1306_WriteString("Opis (2/2)", Font_6x8, White);
     ssd1306_SetCursor(0, 16);
-    ssd1306_WriteString("trolerow. W projek-", Font_6x8, White);
-    ssd1306_SetCursor(0, 26);
-    ssd1306_WriteString("cie nie zostaly uzy-", Font_6x8, White);
-    ssd1306_SetCursor(0, 36);
-    ssd1306_WriteString("te zadne lzy... Do", Font_6x8, White);
-    ssd1306_SetCursor(0, 46);
-    ssd1306_WriteString("projektu uzylismy LCD", Font_6x8, White);
-    ssd1306_SetCursor(0, 56);
-    ssd1306_WriteString("i UART. :D", Font_6x8, White);
+    ssd1306_WriteString("Poruszaj  sie  klawi-", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 1);
+    ssd1306_WriteString("szami   WSAD.  Jestes", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 2);
+    ssd1306_WriteString("caly  czas  w  ruchu.", Font_6x8, White);
+    ssd1306_SetCursor(0, 16 + 10 * 4);
+    ssd1306_WriteString("~Z Bogiem!", Font_6x8, White);
     ssd1306_UpdateScreen();
-    HAL_Delay(5000);
+    HAL_Delay(10000);
 }
 void showScores(void)
 {
-    char buffer[20];
+    char buffer[32];
     ssd1306_Fill(Black);
-    ssd1306_SetCursor(40, 0);
+    ssd1306_DrawBitmap(0, 0, menu, 128, 64, White);
+    // Header
+    ssd1306_SetCursor(40, 15);
     ssd1306_WriteString("Wyniki:", Font_6x8, White);
-    snprintf(buffer, sizeof(buffer), "1. %lu", topScores[0]);
-    ssd1306_SetCursor(10, 16);
+    // Score 1
+    snprintf(buffer, sizeof(buffer), "1. %s %lu", topScores[0].nickname, topScores[0].score);
+    ssd1306_SetCursor(12, 25);
     ssd1306_WriteString(buffer, Font_6x8, White);
-    snprintf(buffer, sizeof(buffer), "2. %lu", topScores[1]);
-    ssd1306_SetCursor(10, 30);
+    // Score 2
+    snprintf(buffer, sizeof(buffer), "2. %s %lu", topScores[1].nickname, topScores[1].score);
+    ssd1306_SetCursor(12, 35);
     ssd1306_WriteString(buffer, Font_6x8, White);
-    snprintf(buffer, sizeof(buffer), "3. %lu", topScores[2]);
-    ssd1306_SetCursor(10, 44);
+    // Score 3
+    snprintf(buffer, sizeof(buffer), "3. %s %lu", topScores[2].nickname, topScores[2].score);
+    ssd1306_SetCursor(12, 45);
     ssd1306_WriteString(buffer, Font_6x8, White);
     ssd1306_UpdateScreen();
     HAL_Delay(3000);
@@ -512,7 +600,7 @@ void winAnimation(void)
                 ssd1306_DrawBitmap(0, 0, fajerwerki11, 128, 64, White);
                 break;
             }
-            ssd1306_SetCursor(37, 39);
+            ssd1306_SetCursor(43, 39);
             ssd1306_WriteString("WYGRANA", Font_6x8, White);
             ssd1306_UpdateScreen();
             HAL_Delay(100);
@@ -521,36 +609,55 @@ void winAnimation(void)
 }
 void loseAnimation(void)
 {
-  for (int i = 0; i < 6; i++)
-  {
-      ssd1306_Fill(Black);
-      ssd1306_DrawCircle(64, 32, 20, White);
-      ssd1306_Line(56, 43, 64, 38, White);
-      ssd1306_Line(64, 38, 72, 43, White);
-      ssd1306_DrawCircle(56, 26, 2, White);
-      ssd1306_DrawCircle(72, 26, 2, White);
-      if (i % 2 == 0)
-      {
-          ssd1306_DrawPixel(54, 26, White);
-          ssd1306_DrawPixel(53, 27, White);
-          ssd1306_DrawPixel(53, 28, White);
-          ssd1306_DrawPixel(54, 29, White);
-          ssd1306_DrawPixel(55, 29, White);
-          ssd1306_DrawPixel(56, 29, White);
-
-      }
-      ssd1306_SetCursor(35, 56);
-      ssd1306_WriteString("PRZEGRANA", Font_6x8, White);
-      ssd1306_UpdateScreen();
-      HAL_Delay(500);
-  }
+    for (int i = 0; i < 10; i++)
+    {
+        ssd1306_Fill(Black);
+        ssd1306_DrawCircle(64, 32, 20, White);
+        ssd1306_Line(56, 43, 64, 38, White);
+        ssd1306_Line(64, 38, 72, 43, White);
+        ssd1306_DrawCircle(56, 26, 2, White);
+        ssd1306_DrawCircle(72, 26, 2, White);
+        if (i % 2 == 0)
+        {
+            ssd1306_DrawPixel(53, 27, White);
+            ssd1306_DrawPixel(52, 28, White);
+            ssd1306_DrawPixel(52, 29, White);
+            ssd1306_DrawPixel(53, 30, White);
+            ssd1306_DrawPixel(54, 30, White);
+            ssd1306_DrawPixel(55, 30, White);
+            ssd1306_DrawPixel(56, 29, White);
+        }
+        ssd1306_SetCursor(37, 56);
+        ssd1306_WriteString("PRZEGRANA", Font_6x8, White);
+        ssd1306_UpdateScreen();
+        HAL_Delay(500);
+    }
 }
-
-void resetGame(player *h, player *b)
+void drawAnimation(void)
 {
-    *h = createPlayer(10, 10);
-    *b = createPlayer(MAP_WIDTH - 10, MAP_HEIGHT - 10);
-    b->speed = h->speed / 2;
+    ssd1306_SetCursor(52, 56);
+    ssd1306_WriteString("REMIS", Font_6x8, White);
+    ssd1306_UpdateScreen();
+    HAL_Delay(2000);
+}
+void resetGame(player *b, player *h)
+{
+    // Player
+    h->x = 15;
+    h->y = 15;
+    h->radius = 3;
+    h->score = 0;
+    h->speed = 3;
+    h->dx = 0;
+    h->dy = 0;
+    // Bot
+    b->x = MAP_WIDTH - 15;
+    b->y = MAP_HEIGHT - 15;
+    b->radius = 3;
+    b->score = 0;
+    b->speed = 3;
+    b->dx = 1;
+    b->dy = 0;
     srand(HAL_GetTick());
     for (int i = 0; i < 10; i++)
         dotPosition(i);
@@ -602,42 +709,45 @@ void store_flash_memory(uint32_t memory_address, uint8_t *data, uint16_t data_le
 }
 void resetHighScores(void)
 {
-    for (int i = 0; i < 3; i++)
-    {
-        topScores[i] = 0;
-    }
+    memset(topScores, 0, sizeof(topScores));
     store_flash_memory(FLASH_ADDRESS_SCORES, (uint8_t *)topScores, sizeof(topScores));
 }
 void loadHighScores(void)
 {
     read_flash_memory(FLASH_ADDRESS_SCORES, (uint8_t *)topScores, sizeof(topScores));
-    if (topScores[0] == 0xFFFFFFFF)
+    if (topScores[0].score == 0xFFFFFFFF)
     {
-        topScores[0] = 0;
-        topScores[1] = 0;
-        topScores[2] = 0;
-        store_flash_memory(FLASH_ADDRESS_SCORES, (uint8_t *)topScores, sizeof(topScores));
+        resetHighScores();
     }
 }
-void updateHighScores(uint32_t newScore)
+void updateHighScores(uint32_t newScore, const char *newName)
 {
     int updated = 0;
-    if (newScore > topScores[0])
+    if (newScore > topScores[0].score)
     {
+        // Move 2nd to 3rd
         topScores[2] = topScores[1];
+        // Move 1st to 2nd
         topScores[1] = topScores[0];
-        topScores[0] = newScore;
+        // New 1st
+        topScores[0].score = newScore;
+        strncpy(topScores[0].nickname, newName, 10);
+        topScores[0].nickname[10] = '\0';
         updated = 1;
     }
-    else if (newScore > topScores[1])
+    else if (newScore > topScores[1].score)
     {
         topScores[2] = topScores[1];
-        topScores[1] = newScore;
+        topScores[1].score = newScore;
+        strncpy(topScores[1].nickname, newName, 10);
+        topScores[1].nickname[10] = '\0';
         updated = 1;
     }
-    else if (newScore > topScores[2])
+    else if (newScore > topScores[2].score)
     {
-        topScores[2] = newScore;
+        topScores[2].score = newScore;
+        strncpy(topScores[2].nickname, newName, 10);
+        topScores[2].nickname[10] = '\0';
         updated = 1;
     }
     if (updated)
@@ -800,9 +910,3 @@ void Error_Handler(void)
     {
     }
 }
-
-
-
-
-
-
