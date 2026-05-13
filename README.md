@@ -5,3 +5,4 @@
 
 ![1769113214762](https://github.com/user-attachments/assets/05ce6b32-5610-43dc-a47c-ea0a8c7901fc)
 
+This game was made for FUN. Dr. A. S. FOREVER!
